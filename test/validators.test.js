@@ -563,6 +563,316 @@ describe('Validators', () => {
     });
   });
 
+  it('should reject slashless URLs for authority-based protocols regardless of options', () => {
+    const optionSets = [
+      undefined,
+      { require_protocol: true },
+      { require_protocol: true, require_valid_protocol: true, protocols: ['http', 'https'] },
+      { require_valid_protocol: false },
+      { protocols: ['http', 'https', 'ftp', 'ws', 'wss'] },
+      { require_protocol_slashes: true },
+    ];
+    optionSets.forEach((options) => {
+      test({
+        validator: 'isURL',
+        args: [options],
+        valid: [
+          'http://example.com',
+          'https://example.com/path',
+          'HTTPS://example.com',
+        ],
+        invalid: [
+          'http:example.com',
+          'https:example.com',
+          'https:evil.example/path',
+          'https:/example.com',
+          'HTTP:example.com',
+          'ws:example.com',
+          'wss:example.com',
+          'https:example.com@evil.example',
+          'http:example.com:8080',
+        ],
+      });
+    });
+
+    // Authority-based schemes outside the default list obey the same rule.
+    test({
+      validator: 'isURL',
+      args: [{ protocols: ['http', 'https', 'ftp', 'ws', 'wss'] }],
+      valid: ['ftp://example.com', 'ws://example.com', 'wss://example.com/socket'],
+      invalid: ['ftp:example.com', 'ws:example.com', 'wss:example.com/socket'],
+    });
+    test({
+      validator: 'isURL',
+      args: [{ require_valid_protocol: false }],
+      valid: ['ftp://example.com', 'ws://example.com', 'wss://example.com/socket'],
+      invalid: ['ftp:example.com', 'ws:example.com', 'wss:example.com/socket'],
+    });
+  });
+
+  it('should keep slashless URLs for opaque schemes when the caller opts out of the guard', () => {
+    test({
+      validator: 'isURL',
+      args: [{ protocols: ['rtmp', 'file'], require_tld: false }],
+      valid: [
+        'rtmp:foobar.com',
+        'rtmp://foobar.com',
+      ],
+      invalid: [
+        'http:example.com',
+        'rtmp:/foobar.com',
+      ],
+    });
+
+    test({
+      validator: 'isURL',
+      args: [{ protocols: ['file'], require_host: false, require_tld: false }],
+      valid: ['file:/foo.txt', 'file:///foo.txt', 'file:foo.txt'],
+      invalid: ['http:example.com'],
+    });
+  });
+
+  it('should require slashes after an explicit protocol when requested', () => {
+    test({
+      validator: 'isURL',
+      args: [{ require_protocol_slashes: true }],
+      valid: [
+        'http://example.com',
+        'https://example.com/path?query=value#fragment',
+        'ftp://example.com',
+        'https://user:password@example.com',
+        'https://[::1]:8080/path',
+        'example.com:8080/path',
+        'user:password@example.com',
+      ],
+      invalid: [
+        'http:example.com',
+        'https:example.com',
+        'https:/example.com',
+        '//example.com',
+      ],
+    });
+  });
+
+  it('should combine require_protocol_slashes with require_protocol', () => {
+    test({
+      validator: 'isURL',
+      args: [{ require_protocol_slashes: true, require_protocol: true }],
+      valid: ['https://example.com'],
+      invalid: [
+        'https:example.com',
+        'example.com',
+        'user:password@example.com',
+        '//example.com',
+      ],
+    });
+  });
+
+  it('should allow protocol-relative URLs when only protocol slashes are required', () => {
+    test({
+      validator: 'isURL',
+      args: [{ require_protocol_slashes: true, allow_protocol_relative_urls: true }],
+      valid: ['//example.com', 'example.com', 'https://example.com'],
+      invalid: ['https:example.com'],
+    });
+  });
+
+  it('should apply the slash rule to custom protocols consistently', () => {
+    // Custom protocol in the allow-list, strict mode on.
+    test({
+      validator: 'isURL',
+      args: [{ require_protocol_slashes: true, protocols: ['custom'] }],
+      valid: ['custom://example.com'],
+      invalid: [
+        'custom:example.com',
+        'custom:something',
+        'custom:8080',
+        'custom:example.com@evil.example',
+      ],
+    });
+
+    // Custom protocol in the allow-list, strict mode off (legacy opaque form).
+    test({
+      validator: 'isURL',
+      args: [{ protocols: ['custom'], require_tld: false }],
+      valid: ['custom://example.com', 'custom:something'],
+      invalid: ['http:example.com'],
+    });
+
+    // require_protocol alone also demands the slashes for custom protocols.
+    test({
+      validator: 'isURL',
+      args: [{ require_protocol: true, protocols: ['custom'] }],
+      valid: ['custom://example.com'],
+      invalid: ['custom:example.com'],
+    });
+
+    // Protocol validation disabled: strict mode still governs authorized custom schemes,
+    // while unrelated opaque schemes never reach the allow-list check.
+    test({
+      validator: 'isURL',
+      args: [{ require_protocol_slashes: true, require_valid_protocol: false, protocols: ['custom'] }],
+      valid: ['custom://example.com'],
+      invalid: ['custom:example.com'],
+    });
+
+    // Full combination table: the list contents and the two strict switches
+    // must agree with each other in every cell.
+    const combinations = [
+      {
+        options: { protocols: ['custom'], require_valid_protocol: true, require_protocol_slashes: true },
+        valid: ['custom://example.com'],
+        invalid: ['custom:example.com', 'custom:something'],
+      },
+      {
+        options: { protocols: ['custom'], require_valid_protocol: true, require_protocol_slashes: false },
+        valid: ['custom://example.com', 'custom:something'],
+        invalid: [],
+      },
+      {
+        options: { require_valid_protocol: false, require_protocol_slashes: true },
+        valid: ['custom://example.com'],
+        invalid: ['custom:example.com', 'custom:something'],
+      },
+      {
+        options: { require_valid_protocol: false, require_protocol_slashes: false },
+        valid: ['custom://example.com', 'custom:something'],
+        invalid: [],
+      },
+      {
+        options: { protocols: ['custom'], require_valid_protocol: true, require_protocol: true },
+        valid: ['custom://example.com'],
+        invalid: ['custom:example.com', 'custom:something'],
+      },
+    ];
+    combinations.forEach((combination) => {
+      test({
+        validator: 'isURL',
+        args: [{ require_tld: false, ...combination.options }],
+        valid: combination.valid,
+        invalid: combination.invalid,
+      });
+    });
+  });
+
+  it('should not let the slashless form bypass the host whitelist', () => {
+    test({
+      validator: 'isURL',
+      args: [{ host_whitelist: ['trusted.example'] }],
+      valid: [
+        'https://trusted.example',
+        'http://trusted.example/path',
+        'https://user:password@trusted.example',
+      ],
+      invalid: [
+        'https:evil.example',
+        'http:evil.example',
+        'https://evil.example',
+        'https:evil.example@trusted.example',
+      ],
+    });
+  });
+
+  it('should not let backslashes in the authority reach a different host', () => {
+    // URL consumers treat `\` as `/` in an authority-based URL, so the host
+    // after `//` must be the one validated; splitting on `@` alone would read
+    // the text behind the backslash as the host.
+    test({
+      validator: 'isURL',
+      args: [{ host_whitelist: ['trusted.example'] }],
+      valid: [
+        'https://trusted.example',
+        'https://trusted.example/path\\with-backslash',
+      ],
+      invalid: [
+        'https:evil.example\\@trusted.example',
+        'https://evil.example\\@trusted.example',
+        'http://evil.example\\@trusted.example/path',
+      ],
+    });
+
+    test({
+      validator: 'isURL',
+      args: [{ require_tld: false }],
+      valid: [
+        'http://example.com/foo\\bar',
+      ],
+      invalid: [
+        'http://foo\\bar.com',
+        'foo\\bar.com',
+      ],
+    });
+
+    // With `//` the tail is an authority and must be a host, so a backslash in
+    // it is rejected uniformly; past the first `/` it is ordinary path content.
+    test({
+      validator: 'isURL',
+      args: [{ require_tld: false, protocols: ['rtmp', 'custom'] }],
+      valid: [
+        'custom://example.com/path\\with-backslash',
+      ],
+      invalid: ['rtmp://foo\\bar.com'],
+    });
+
+    // Protocol-relative strings follow the same authority rules.
+    test({
+      validator: 'isURL',
+      args: [{ allow_protocol_relative_urls: true, host_whitelist: ['trusted.example'] }],
+      valid: ['//trusted.example'],
+      invalid: ['//evil.example\\@trusted.example'],
+    });
+  });
+
+  it('should not regress the host:port heuristic when protocol slashes are required', () => {
+    test({
+      validator: 'isURL',
+      args: [{
+        require_tld: false,
+        require_protocol_slashes: true,
+        require_valid_protocol: false,
+      }],
+      valid: [
+        'localhost:3000',
+        'service-name:8080',
+        'http://localhost:3000',
+      ],
+      invalid: [
+        'http:localhost:3000',
+      ],
+    });
+  });
+
+  it('should keep rejecting the historical protocol-confusion payloads', () => {
+    const optionSets = [
+      undefined,
+      { require_protocol: true },
+      { require_protocol_slashes: true },
+      { protocols: ['http', 'https', 'ftp', 'javascript'], require_protocol_slashes: true },
+    ];
+    // Regression floor for CVE-2025-56200 and the URL-encoded follow-up.
+    /* eslint-disable no-script-url */
+    const invalidPayloads = [
+      'javascript:alert(1);@example.com',
+      'JaVaScRiPt:alert(1)@example.com',
+      'javascript:alert(1)@example.com',
+      'javascript:alert(1)@user@example.com',
+      'javascript:alert(1)@example.com?q=safe',
+      'javascript:%61%6c%65%72%74%28%31%29@example.com',
+      'javascript:%22@a.com#";alert(origin)//',
+      'data:text/html,<script>alert(1)</script>@example.com',
+      'vbscript:msgbox("XSS")@example.com',
+      '//evil-site.com/path@example.com',
+    ];
+    /* eslint-enable no-script-url */
+    optionSets.forEach((options) => {
+      test({
+        validator: 'isURL',
+        args: [options],
+        invalid: invalidPayloads,
+      });
+    });
+  });
+
   it('should validate file URLs without a host', () => {
     test({
       validator: 'isURL',

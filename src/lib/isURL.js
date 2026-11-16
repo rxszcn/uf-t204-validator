@@ -12,6 +12,8 @@ options for isURL method
 protocols - valid protocols can be modified with this option.
 require_tld - If set to false isURL will not check if the URL's host includes a top-level domain.
 require_protocol - if set to true isURL will return false if protocol is not present in the URL.
+require_protocol_slashes - if set to true, an explicit protocol must be followed by `//`
+                             (e.g. `https://example.com` passes, `https:example.com` fails).
 require_host - if set to false isURL will not check if host is present in the URL.
 require_port - if set to true isURL will check if port is present in the URL.
 require_valid_protocol - isURL will check if the URL's protocol is present in the protocols option.
@@ -39,6 +41,7 @@ const default_url_options = {
   protocols: ['http', 'https', 'ftp'],
   require_tld: true,
   require_protocol: false,
+  require_protocol_slashes: false,
   require_host: true,
   require_port: false,
   require_valid_protocol: true,
@@ -52,6 +55,17 @@ const default_url_options = {
 };
 
 const wrapped_ipv6 = /^\[([^\]]+)\](?::([0-9]+))?$/;
+
+// Protocols that URL consumers (browsers, `fetch`, HTTP/WebSocket clients)
+// always resolve to an authority form (`scheme://host`). For these,
+// `https:example.com` is normalized to `https://example.com`, so a string that
+// never wrote the `//` would otherwise pass the protocol gate while the caller
+// keeps talking about a different shape. Requiring the slashes for these
+// protocols is unconditional: it is the consumer-level discrepancy that enables
+// open redirects and SSRF, not a choice the caller should have to opt out of.
+// `file` is deliberately excluded: `file:/path` is a valid RFC 8089 form and is
+// not reachable through the redirect/request primitives this guard targets.
+const authority_based_protocols = ['http', 'https', 'ftp', 'ws', 'wss'];
 
 export default function isURL(url, options) {
   assertString(url);
@@ -91,6 +105,17 @@ export default function isURL(url, options) {
   let had_explicit_protocol = false;
 
   const cleanUpProtocol = (potential_protocol) => {
+    const after_protocol = url.substring(protocol_match[0].length);
+    const requires_slashes = options.require_protocol || options.require_protocol_slashes;
+
+    // Strict callers may require the explicit `//` form for every protocol,
+    // including custom (opaque) schemes. `require_protocol` implies it as well:
+    // a scheme without an authority does not satisfy "the protocol is present"
+    // in the sense a URL consumer understands it.
+    if (requires_slashes && after_protocol.slice(0, 2) !== '//') {
+      return false;
+    }
+
     had_explicit_protocol = true;
     protocol = potential_protocol.toLowerCase();
 
@@ -100,20 +125,33 @@ export default function isURL(url, options) {
     }
 
     // Remove the protocol from the URL string.
-    return url.substring(protocol_match[0].length);
+    return after_protocol;
   };
 
   if (protocol_match) {
     const potential_protocol = protocol_match[1];
     const after_colon = url.substring(protocol_match[0].length);
+    const normalized_protocol = potential_protocol.toLowerCase();
+    const starts_with_slashes = after_colon.slice(0, 2) === '//';
+
+    // An authority-based scheme is always parsed by URL consumers as
+    // `scheme://host`, even when the `//` was never written. Reject the
+    // slashless form outright: otherwise `https:evil.example` passes the
+    // protocol whitelist gate while the browser or HTTP client follows it to
+    // `https://evil.example`, which is the open-redirect / SSRF primitive.
+    // This check runs before the auth and port heuristics because a known
+    // authority-based scheme cannot be authentication credentials or a host
+    // name with a port.
+    if (!starts_with_slashes &&
+      authority_based_protocols.indexOf(normalized_protocol) !== -1) {
+      return false;
+    }
 
     // Check if what follows looks like authentication credentials (user:password@host)
     // rather than a protocol. This happens when:
     // 1. There's no `//` after the colon (protocols like `http://` have this)
     // 2. There's an `@` symbol before any `/`
     // 3. The part before `@` contains only valid auth characters (alphanumeric, -, _, ., %, :)
-    const starts_with_slashes = after_colon.slice(0, 2) === '//';
-
     if (!starts_with_slashes) {
       const first_slash_position = after_colon.indexOf('/');
       const before_slash = first_slash_position === -1
@@ -134,6 +172,15 @@ export default function isURL(url, options) {
         if (is_valid_auth && !has_encoded_content) {
           // This looks like authentication (e.g., user:password@host), not a protocol
           if (options.require_protocol) {
+            return false;
+          }
+
+          // If the caller's protocol list explicitly authorizes this scheme,
+          // treat it as a protocol rather than as credentials: `custom:host@x`
+          // must obey the same slash rule as `custom://host@x`, otherwise the
+          // strict option can be sidestepped by appending an `@`.
+          if (options.require_protocol_slashes
+            && options.protocols.indexOf(normalized_protocol) !== -1) {
             return false;
           }
 
@@ -158,6 +205,16 @@ export default function isURL(url, options) {
           if (options.require_protocol) {
             return false;
           }
+
+          // Unless the scheme is explicitly authorized by the caller, in which
+          // case `custom:8080` is the opaque form of an allowed protocol and
+          // must obey the same slash rule as `custom://host`. A numeric tail
+          // does not make an authorized scheme a host:port.
+          if (options.require_protocol_slashes
+            && options.protocols.indexOf(normalized_protocol) !== -1) {
+            return false;
+          }
+
           // Don't consume anything; let it be parsed as hostname:port
         } else {
           // This is definitely a protocol
@@ -183,12 +240,27 @@ export default function isURL(url, options) {
   // Handle leading '//' only as protocol-relative when there was NO explicit protocol.
   // If there was an explicit protocol, '//' is the normal separator
   // and should be stripped unconditionally.
+  let had_authority = false;
   if (url.slice(0, 2) === '//') {
     if (!had_explicit_protocol && !options.allow_protocol_relative_urls) {
       return false;
     }
 
+    had_authority = true;
     url = url.slice(2);
+  }
+
+  // URL consumers treat `\` as `/` inside an authority (WHATWG special URLs),
+  // so `https://evil.example\@trusted.example` has host `evil.example`, while a
+  // naive split on `@` reads `trusted.example`; a whitelist would pass the
+  // string and the client would still visit the other host. Reject a backslash
+  // in the authority segment so the validated host is the visited host. The
+  // check only covers strings that actually carry an authority — after `//`,
+  // or a bare host when no protocol was present. Opaque forms such as
+  // `rtmp:foo\bar` keep their previous treatment.
+  const has_authority = had_authority || !had_explicit_protocol;
+  if (has_authority && url.split('/')[0].indexOf('\\') !== -1) {
+    return false;
   }
 
   if (url === '') {
